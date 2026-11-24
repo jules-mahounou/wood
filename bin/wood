@@ -1,0 +1,144 @@
+#!/data/data/com.termux/files/usr/bin/env python3
+# wood — collecteur passif de beacons Wi-Fi + GPS (Termux)
+import json, subprocess, sqlite3, time, sys, os, argparse
+from datetime import datetime, timezone
+
+DB = os.path.expanduser("~/.wood/wood.db")
+INTERVALLE = 30  # secondes entre deux scans
+
+def connexion():
+    os.makedirs(os.path.dirname(DB), exist_ok=True)
+    con = sqlite3.connect(DB)
+    con.execute("PRAGMA journal_mode=WAL")  # lecture/écriture simultanées (start + watch)
+    con.execute("""CREATE TABLE IF NOT EXISTS releves (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vu_le TEXT, bssid TEXT, ssid TEXT, canal INTEGER,
+        freq INTEGER, rssi INTEGER, securite TEXT,
+        lat REAL, lon REAL, precision_m REAL)""")
+    con.commit()
+    return con
+
+def freq_vers_canal(mhz):
+    if not mhz: return None
+    if mhz == 2484: return 14
+    if 2412 <= mhz <= 2472: return (mhz - 2412)//5 + 1
+    if 5000 <= mhz <= 5900: return (mhz - 5000)//5
+    return None
+
+def cmd_json(args):
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        txt = out.stdout.strip()
+        return json.loads(txt) if txt else None
+    except Exception as e:
+        print(f"  ! {args[0]} : {e}", file=sys.stderr)
+        return None
+
+def scanner():
+    d = cmd_json(["termux-wifi-scaninfo"])
+    return d if isinstance(d, list) else []
+
+def position():
+    loc = cmd_json(["termux-location", "-p", "network"])
+    if not loc: return (None, None, None)
+    return (loc.get("latitude"), loc.get("longitude"), loc.get("accuracy"))
+
+def norm(r):
+    freq = r.get("frequency_mhz") or r.get("frequency")
+    return {"bssid": r.get("bssid"),
+            "ssid": r.get("ssid") or "(masqué)",
+            "canal": freq_vers_canal(freq), "freq": freq,
+            "rssi": r.get("rssi") or r.get("level"),
+            "securite": r.get("capabilities") or r.get("security") or ""}
+
+def enregistrer(con, reseaux, lat, lon, prec):
+    vu = datetime.now(timezone.utc).isoformat()
+    for raw in reseaux:
+        r = norm(raw)
+        con.execute("INSERT INTO releves (vu_le,bssid,ssid,canal,freq,rssi,securite,lat,lon,precision_m)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (vu, r["bssid"], r["ssid"], r["canal"], r["freq"],
+                     r["rssi"], r["securite"], lat, lon, prec))
+    con.commit()
+    return vu
+
+def cmd_start(a):
+    con = connexion()
+    print(f"wood start — collecte en continu (toutes les {INTERVALLE}s). Ctrl-C pour arrêter.\n")
+    try:
+        while True:
+            lat, lon, prec = position()
+            reseaux = scanner()
+            vu = enregistrer(con, reseaux, lat, lon, prec)
+            print(f"[{vu[11:19]}] {len(reseaux)} réseaux  (pos {lat}, {lon})")
+            time.sleep(INTERVALLE)
+    except KeyboardInterrupt:
+        print("\narrêt.")
+    finally:
+        con.close()
+
+def cmd_update(a):
+    con = connexion()
+    lat, lon, prec = position()
+    reseaux = scanner()
+    enregistrer(con, reseaux, lat, lon, prec)
+    print(f"{len(reseaux)} réseaux captés et enregistrés.\n")
+    for raw in reseaux:
+        r = norm(raw)
+        print(f"   {r['ssid']:<24} {r['bssid']}  canal {r['canal']}  {r['rssi']} dBm  {r['securite']}")
+    con.close()
+
+def cmd_watch(a):
+    con = connexion()
+    dernier = con.execute("SELECT COALESCE(MAX(id),0) FROM releves").fetchone()[0]
+    print("wood watch — nouveaux relevés en direct. Ctrl-C pour arrêter.\n")
+    try:
+        while True:
+            for row in con.execute(
+                "SELECT id,vu_le,ssid,bssid,canal,rssi,securite FROM releves WHERE id>? ORDER BY id",
+                (dernier,)).fetchall():
+                dernier = row[0]
+                print(f"[{row[1][11:19]}] {row[2]:<24} {row[3]}  canal {row[4]}  {row[5]} dBm  {row[6]}")
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("\narrêt.")
+    finally:
+        con.close()
+
+def cmd_stats(a):
+    con = connexion()
+    q = con.execute
+    total = q("SELECT COUNT(*) FROM releves").fetchone()[0]
+    if total == 0:
+        print("Base vide. Lance d'abord 'wood start' ou 'wood update'."); con.close(); return
+    uniq = q("SELECT COUNT(DISTINCT bssid) FROM releves").fetchone()[0]
+    print(f"Relevés enregistrés : {total}")
+    print(f"Bornes uniques      : {uniq}")
+    print("\nPar type de sécurité :")
+    for sec, n in q("""SELECT CASE
+                WHEN securite LIKE '%WPA3%' THEN 'WPA3'
+                WHEN securite LIKE '%WPA2%' THEN 'WPA2'
+                WHEN securite LIKE '%WPA%'  THEN 'WPA'
+                WHEN securite LIKE '%WEP%'  THEN 'WEP'
+                ELSE 'ouvert' END t, COUNT(DISTINCT bssid)
+                FROM releves GROUP BY t ORDER BY 2 DESC""").fetchall():
+        print(f"   {sec:<8} {n}")
+    print("\nTop 5 bornes les plus vues :")
+    for ssid, bssid, n in q("""SELECT ssid,bssid,COUNT(*) c FROM releves
+                GROUP BY bssid ORDER BY c DESC LIMIT 5""").fetchall():
+        print(f"   {ssid:<24} {bssid}  ({n}×)")
+    con.close()
+
+def main():
+    p = argparse.ArgumentParser(prog="wood", description="Collecteur passif de beacons Wi-Fi (Termux)")
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("start",  help="collecte en continu")
+    sub.add_parser("update", help="un scan unique immédiat")
+    sub.add_parser("watch",  help="affiche les nouveaux relevés en direct")
+    sub.add_parser("stats",  help="bilan de la base")
+    a = p.parse_args()
+    {"start": cmd_start, "update": cmd_update,
+     "watch": cmd_watch, "stats": cmd_stats}.get(a.cmd, lambda _: p.print_help())(a)
+
+if __name__ == "__main__":
+    main()

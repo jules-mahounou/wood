@@ -1,0 +1,6 @@
+# Base de données locale et artefacts Python
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
