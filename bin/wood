@@ -398,6 +398,15 @@ CARTE = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>html,body,#m{height:100%;margin:0}</style></head>
 <body><div id="m"></div><script>
 var pts=__POINTS__;
+// Bornes captées au même endroit (ex. collecte immobile) : on les écarte
+// en petit cercle (~9 m) pour qu'elles soient toutes visibles et comptables.
+var groupes={};
+pts.forEach(function(p){var k=p.lat.toFixed(5)+','+p.lon.toFixed(5);
+  (groupes[k]=groupes[k]||[]).push(p);});
+Object.keys(groupes).forEach(function(k){var g=groupes[k];
+  if(g.length>1){var R=0.00008;
+    g.forEach(function(p,i){var a=2*Math.PI*i/g.length;
+      p.lat+=R*Math.cos(a); p.lon+=R*Math.sin(a);});}});
 var map=L.map('m');
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
  {maxZoom:19,attribution:'© OpenStreetMap'}).addTo(map);
