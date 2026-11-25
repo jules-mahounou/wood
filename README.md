@@ -51,11 +51,15 @@ le vrai sniffing continu demanderait le root + une puce compatible.)
 
 ## Utilisation
 
-| Commande       | Rôle                                                        |
-|----------------|-------------------------------------------------------------|
-| `wood`         | **dashboard temps réel** (bornes triées par signal, live)   |
-| `wood update`  | un scan unique immédiat, l'affiche et l'enregistre          |
-| `wood stats`   | bilan : bornes uniques, répartition par sécurité, top bornes |
+| Commande        | Rôle                                                        |
+|-----------------|-------------------------------------------------------------|
+| `wood`          | **dashboard temps réel** (bornes triées par signal, live)   |
+| `wood scan`     | un scan unique immédiat, l'affiche et l'enregistre          |
+| `wood stats`    | bilan : bornes uniques, répartition par sécurité, top bornes |
+| `wood upgrade`  | met à jour wood depuis GitHub (git pull + réinstallation)   |
+
+Après la première installation, plus besoin de refaire `git pull` à la main :
+un simple `wood upgrade` (ou `wood update`) récupère la dernière version.
 
 Pour collecter écran éteint :
 

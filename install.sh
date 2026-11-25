@@ -8,9 +8,15 @@ pkg install -y python termux-api
 echo ">> Module d'affichage (rich)..."
 pip install --upgrade rich
 
+SRC="$(cd "$(dirname "$0")" && pwd)"
+
 echo ">> Installation du binaire wood dans \$PREFIX/bin..."
-install -m 755 "$(dirname "$0")/bin/wood" "$PREFIX/bin/wood"
+install -m 755 "$SRC/bin/wood" "$PREFIX/bin/wood"
 termux-fix-shebang "$PREFIX/bin/wood" 2>/dev/null || true
+
+# mémorise l'emplacement du dépôt pour 'wood upgrade'
+mkdir -p "$HOME/.wood"
+echo "$SRC" > "$HOME/.wood/source"
 
 echo
 echo "Terminé. Tape 'wood' pour lancer le dashboard temps réel."

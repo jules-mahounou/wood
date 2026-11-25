@@ -164,7 +164,7 @@ def cmd_live(a):
         with _lock:
             print(f"arrêt. {len(_store)} bornes uniques vues cette session.")
 
-def cmd_update(a):
+def cmd_scan(a):
     con = connexion()
     lat, lon, prec = position()
     reseaux = scanner()
@@ -202,14 +202,31 @@ def cmd_stats(a):
         print(f"   {ssid:<24} {bssid}  ({n}×)")
     con.close()
 
+def cmd_upgrade(a):
+    src_file = os.path.expanduser("~/.wood/source")
+    if not os.path.exists(src_file):
+        print("Source inconnue. Refais une fois :  cd wood && bash install.sh"); return
+    src = open(src_file).read().strip()
+    print(f"Mise à jour depuis {src} ...")
+    if subprocess.run(["git", "-C", src, "pull"]).returncode != 0:
+        print("Échec du git pull (réseau ? dépôt déplacé ?)."); return
+    prefix = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
+    subprocess.run(["install", "-m", "755", os.path.join(src, "bin", "wood"),
+                    os.path.join(prefix, "bin", "wood")])
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "rich"])
+    print("wood est à jour. Relance 'wood'.")
+
 def main():
     p = argparse.ArgumentParser(prog="wood", description="Collecteur passif de beacons Wi-Fi, temps réel (Termux)")
     sub = p.add_subparsers(dest="cmd")
-    sub.add_parser("live",   help="dashboard temps réel (défaut)")
-    sub.add_parser("update", help="un scan unique immédiat")
-    sub.add_parser("stats",  help="bilan de la base")
+    sub.add_parser("live",    help="dashboard temps réel (défaut)")
+    sub.add_parser("scan",    help="un scan unique immédiat")
+    sub.add_parser("stats",   help="bilan de la base")
+    sub.add_parser("update",  help="met à jour wood depuis GitHub")
+    sub.add_parser("upgrade", help="met à jour wood depuis GitHub (alias)")
     a = p.parse_args()
-    {"live": cmd_live, "update": cmd_update, "stats": cmd_stats}.get(a.cmd, cmd_live)(a)
+    {"live": cmd_live, "scan": cmd_scan, "stats": cmd_stats,
+     "update": cmd_upgrade, "upgrade": cmd_upgrade}.get(a.cmd, cmd_live)(a)
 
 if __name__ == "__main__":
     main()
