@@ -79,8 +79,8 @@ def _boucle_scan(con):
                          r["rssi"], r["securite"], lat, lon, prec))
             with _lock:
                 e = _store.get(r["bssid"], {"vu_count": 0})
-                e.update(ssid=r["ssid"], canal=r["canal"], securite=r["securite"],
-                         rssi=r["rssi"], freq=r["freq"], last=vu)
+                e.update(bssid=r["bssid"], ssid=r["ssid"], canal=r["canal"],
+                         securite=r["securite"], rssi=r["rssi"], freq=r["freq"], last=vu)
                 e["vu_count"] += 1
                 _store[r["bssid"]] = e
         if rows:
@@ -112,27 +112,30 @@ def _secu(s):
     if "WPA2" in s: return Text("WPA2", "cyan")
     if "WPA"  in s: return Text("WPA",  "yellow")
     if "WEP"  in s: return Text("WEP",  "yellow")
-    return Text("OUVERT", "bold red")
+    return Text("OPEN", "bold red")
 
 def _rendu():
     from rich.table import Table
     from rich.panel import Panel
     from rich.console import Group
     from rich.text import Text
+    from rich import box
     with _lock:
         items = sorted(_store.values(), key=lambda e: (e.get("rssi") or -999), reverse=True)
         pos = dict(_pos); total = len(_store)
         ouverts = sum(1 for e in _store.values() if est_ouvert(e.get("securite", "")))
-    t = Table(expand=True, header_style="bold green", border_style="green")
-    t.add_column("SSID", ratio=3, no_wrap=True)
-    t.add_column("BSSID", ratio=3, no_wrap=True)
-    t.add_column("Ch", justify="right")
-    t.add_column("Sécurité")
-    t.add_column("Signal", ratio=2)
-    t.add_column("Vu", justify="right")
+    t = Table(expand=True, box=box.SIMPLE_HEAD, header_style="bold green",
+              border_style="green", pad_edge=False, padding=(0, 1))
+    t.add_column("SSID", ratio=2, no_wrap=True, overflow="ellipsis")
+    t.add_column("Signal", no_wrap=True)
+    t.add_column("Séc", width=4)
+    t.add_column("Ch", justify="right", width=3)
+    t.add_column("BSSID", ratio=2, no_wrap=True, overflow="ellipsis")
+    t.add_column("Vu", justify="right", width=3)
     for e in items[:40]:
-        t.add_row(e.get("ssid", "?"), e.get("bssid", ""), str(e.get("canal") or "?"),
-                  _secu(e.get("securite", "")), _barre(e.get("rssi")), str(e.get("vu_count", 0)))
+        t.add_row(e.get("ssid", "?"), _barre(e.get("rssi")),
+                  _secu(e.get("securite", "")), str(e.get("canal") or "?"),
+                  e.get("bssid", ""), str(e.get("vu_count", 0)))
     gps = f"GPS {pos['lat']:.5f},{pos['lon']:.5f}" if pos["lat"] else "GPS …"
     entete = Text.assemble(
         ("WOOD ", "bold bright_green"), (f"v{VERSION}   ", "green"),
