@@ -51,15 +51,28 @@ le vrai sniffing continu demanderait le root + une puce compatible.)
 
 ## Utilisation
 
-| Commande        | Rôle                                                        |
-|-----------------|-------------------------------------------------------------|
-| `wood`          | **dashboard temps réel** (bornes triées par signal, live)   |
-| `wood scan`     | un scan unique immédiat, l'affiche et l'enregistre          |
-| `wood stats`    | bilan : bornes uniques, répartition par sécurité, top bornes |
-| `wood upgrade`  | met à jour wood depuis GitHub (git pull + réinstallation)   |
+| Commande            | Rôle                                                         |
+|---------------------|--------------------------------------------------------------|
+| `wood`              | **dashboard temps réel** (bornes triées par signal, live)    |
+| `wood --open`       | dashboard, seulement les réseaux ouverts                     |
+| `wood --ch 6`       | dashboard, seulement le canal 6                              |
+| `wood scan`         | un scan unique immédiat, l'affiche et l'enregistre           |
+| `wood stats`        | bilan : bornes uniques, répartition par sécurité, top bornes |
+| `wood channels`     | histogramme d'occupation des canaux                          |
+| `wood twins`        | détecte les SSID portés par plusieurs bornes (evil twin)     |
+| `wood track <BSSID>`| suit le signal d'une borne précise (plus fort = plus proche) |
+| `wood map`          | génère une carte HTML des bornes géolocalisées               |
+| `wood export csv`   | exporte la base (`csv`, `json` ou `gpx`)                      |
+| `wood upgrade`      | met à jour wood depuis GitHub (git pull + réinstallation)    |
 
 Après la première installation, plus besoin de refaire `git pull` à la main :
 un simple `wood upgrade` (ou `wood update`) récupère la dernière version.
+
+### Constructeurs (OUI)
+
+La colonne **Borne** affiche le constructeur quand le préfixe de la MAC (OUI)
+est connu, sinon la MAC brute. Pour enrichir la reconnaissance, dépose un
+fichier `~/.wood/oui.csv` au format `AABBCC,Constructeur` (une ligne par OUI).
 
 Pour collecter écran éteint :
 

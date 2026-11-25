@@ -1,18 +1,38 @@
 #!/data/data/com.termux/files/usr/bin/env python3
 # wood — collecteur passif de beacons Wi-Fi + GPS, temps réel (Termux)
-import json, subprocess, sqlite3, time, sys, os, argparse, threading
+import json, subprocess, sqlite3, time, sys, os, argparse, threading, csv as _csv
 from datetime import datetime, timezone
 
 DB = os.path.expanduser("~/.wood/wood.db")
-SCAN_INTERVAL = 2     # secondes entre deux scans Wi-Fi
-LOC_INTERVAL  = 10    # secondes entre deux relevés GPS
-VERSION = "0.2.0"
+SCAN_INTERVAL = 2
+LOC_INTERVAL  = 10
+VERSION = "0.3.0"
 
-# ---------- état partagé entre threads ----------
-_lock  = threading.Lock()
-_store = {}   # bssid -> {ssid, canal, securite, rssi, freq, vu_count, last}
-_pos   = {"lat": None, "lon": None, "prec": None}
-_stop  = threading.Event()
+# ---------- état partagé ----------
+_lock   = threading.Lock()
+_store  = {}   # bssid -> {bssid, ssid, canal, securite, rssi, freq, vu_count, last}
+_pos    = {"lat": None, "lon": None, "prec": None}
+_stop   = threading.Event()
+_filtre = {"open": False, "ch": None}
+
+# ---------- constructeurs (OUI) ----------
+OUI = {"00:50:56": "VMware", "00:0C:29": "VMware", "00:05:69": "VMware",
+       "B8:27:EB": "Raspberry Pi", "DC:A6:32": "Raspberry Pi", "E4:5F:01": "Raspberry Pi"}
+
+def charger_oui():
+    f = os.path.expanduser("~/.wood/oui.csv")  # format: AABBCC,Constructeur  (ou AA:BB:CC,...)
+    if not os.path.exists(f): return
+    for line in open(f, encoding="utf-8", errors="ignore"):
+        p = line.strip().split(",", 1)
+        if len(p) != 2: continue
+        pref = p[0].replace("-", ":").replace(".", ":").upper()
+        if len(pref) == 6:
+            pref = ":".join(pref[i:i+2] for i in range(0, 6, 2))
+        OUI[pref] = p[1].strip()
+
+def vendor(bssid):
+    if not bssid: return ""
+    return OUI.get(bssid[:8].upper(), "")
 
 # ---------- base ----------
 def connexion():
@@ -63,7 +83,12 @@ def norm(r):
 def est_ouvert(s):
     return ("WPA" not in s) and ("WEP" not in s)
 
-# ---------- moteur temps réel (threads) ----------
+def secu_tag(s):
+    for t in ("WPA3", "WPA2", "WPA", "WEP"):
+        if t in s: return t
+    return "OPEN"
+
+# ---------- moteur temps réel ----------
 def _boucle_scan(con):
     while not _stop.is_set():
         reseaux = scanner()
@@ -73,8 +98,7 @@ def _boucle_scan(con):
         rows = []
         for raw in reseaux:
             r = norm(raw)
-            if not r["bssid"]:
-                continue
+            if not r["bssid"]: continue
             rows.append((vu, r["bssid"], r["ssid"], r["canal"], r["freq"],
                          r["rssi"], r["securite"], lat, lon, prec))
             with _lock:
@@ -98,21 +122,20 @@ def _boucle_pos():
             _pos.update(lat=lat, lon=lon, prec=prec)
         _stop.wait(LOC_INTERVAL)
 
-# ---------- affichage (rich) ----------
+# ---------- affichage rich ----------
 def _barre(rssi):
     from rich.text import Text
     if rssi is None: return Text("—")
-    n = max(0, min(5, (rssi + 95)//12))     # -95 → 0, -35 → 5
+    n = max(0, min(5, (rssi + 95)//12))
     col = "bright_green" if n >= 4 else "yellow" if n >= 2 else "red"
     return Text("█"*n + "░"*(5-n) + f" {rssi}", style=col)
 
 def _secu(s):
     from rich.text import Text
-    if "WPA3" in s: return Text("WPA3", "bright_green")
-    if "WPA2" in s: return Text("WPA2", "cyan")
-    if "WPA"  in s: return Text("WPA",  "yellow")
-    if "WEP"  in s: return Text("WEP",  "yellow")
-    return Text("OPEN", "bold red")
+    t = secu_tag(s)
+    col = {"WPA3": "bright_green", "WPA2": "cyan", "WPA": "yellow",
+           "WEP": "yellow", "OPEN": "bold red"}[t]
+    return Text(t, col)
 
 def _rendu():
     from rich.table import Table
@@ -121,26 +144,31 @@ def _rendu():
     from rich.text import Text
     from rich import box
     with _lock:
-        items = sorted(_store.values(), key=lambda e: (e.get("rssi") or -999), reverse=True)
-        pos = dict(_pos); total = len(_store)
-        ouverts = sum(1 for e in _store.values() if est_ouvert(e.get("securite", "")))
+        vals = list(_store.values()); tous = len(_store); pos = dict(_pos)
+    if _filtre["open"]:
+        vals = [e for e in vals if est_ouvert(e.get("securite", ""))]
+    if _filtre["ch"] is not None:
+        vals = [e for e in vals if e.get("canal") == _filtre["ch"]]
+    items = sorted(vals, key=lambda e: (e.get("rssi") or -999), reverse=True)
+    ouverts = sum(1 for e in _store.values() if est_ouvert(e.get("securite", "")))
     t = Table(expand=True, box=box.SIMPLE_HEAD, header_style="bold green",
               border_style="green", pad_edge=False, padding=(0, 1))
     t.add_column("SSID", ratio=2, no_wrap=True, overflow="ellipsis")
     t.add_column("Signal", no_wrap=True)
     t.add_column("Séc", width=4)
     t.add_column("Ch", justify="right", width=3)
-    t.add_column("BSSID", ratio=2, no_wrap=True, overflow="ellipsis")
+    t.add_column("Borne", ratio=2, no_wrap=True, overflow="ellipsis")
     t.add_column("Vu", justify="right", width=3)
     for e in items[:40]:
         t.add_row(e.get("ssid", "?"), _barre(e.get("rssi")),
                   _secu(e.get("securite", "")), str(e.get("canal") or "?"),
-                  e.get("bssid", ""), str(e.get("vu_count", 0)))
+                  vendor(e.get("bssid")) or e.get("bssid", ""), str(e.get("vu_count", 0)))
     gps = f"GPS {pos['lat']:.5f},{pos['lon']:.5f}" if pos["lat"] else "GPS …"
+    nb = f"{len(items)}/{tous}" if (_filtre["open"] or _filtre["ch"] is not None) else str(tous)
     entete = Text.assemble(
         ("WOOD ", "bold bright_green"), (f"v{VERSION}   ", "green"),
         (f"{os.cpu_count() or '?'} cœurs   ", "white"),
-        (f"{total} bornes   ", "bold white"),
+        (f"{nb} bornes   ", "bold white"),
         (f"{ouverts} ouvertes   ", "red"), (gps, "cyan"),
         ("   [Ctrl-C quitter]", "dim"))
     return Panel(Group(entete, t), border_style="green",
@@ -152,14 +180,15 @@ def cmd_live(a):
         from rich.live import Live
     except ImportError:
         print("Le module 'rich' manque.  Installe-le :  pip install rich"); return
+    _filtre["open"] = getattr(a, "open", False)
+    _filtre["ch"] = getattr(a, "ch", None)
     con = connexion()
     threading.Thread(target=_boucle_scan, args=(con,), daemon=True).start()
     threading.Thread(target=_boucle_pos, daemon=True).start()
     try:
         with Live(_rendu(), refresh_per_second=4, screen=True) as live:
             while not _stop.is_set():
-                live.update(_rendu())
-                time.sleep(0.25)
+                live.update(_rendu()); time.sleep(0.25)
     except KeyboardInterrupt:
         pass
     finally:
@@ -181,14 +210,15 @@ def cmd_scan(a):
     print(f"{len(reseaux)} réseaux captés et enregistrés.\n")
     for raw in reseaux:
         r = norm(raw)
-        print(f"   {r['ssid']:<24} {r['bssid']}  canal {r['canal']}  {r['rssi']} dBm  {r['securite']}")
+        marque = vendor(r["bssid"]) or r["bssid"]
+        print(f"   {r['ssid']:<22} {marque:<18} canal {r['canal']}  {r['rssi']} dBm  {secu_tag(r['securite'])}")
     con.close()
 
 def cmd_stats(a):
     con = connexion(); q = con.execute
     total = q("SELECT COUNT(*) FROM releves").fetchone()[0]
     if total == 0:
-        print("Base vide. Lance 'wood' (temps réel) ou 'wood update'."); con.close(); return
+        print("Base vide. Lance 'wood' (temps réel) ou 'wood scan'."); con.close(); return
     uniq = q("SELECT COUNT(DISTINCT bssid) FROM releves").fetchone()[0]
     print(f"Relevés enregistrés : {total}\nBornes uniques      : {uniq}\n\nPar type de sécurité :")
     for sec, n in q("""SELECT CASE
@@ -202,8 +232,129 @@ def cmd_stats(a):
     print("\nTop 5 bornes les plus vues :")
     for ssid, bssid, n in q("""SELECT ssid,bssid,COUNT(*) c FROM releves
                 GROUP BY bssid ORDER BY c DESC LIMIT 5""").fetchall():
-        print(f"   {ssid:<24} {bssid}  ({n}×)")
+        print(f"   {ssid:<22} {bssid}  ({n}×)")
     con.close()
+
+def cmd_channels(a):
+    con = connexion()
+    rows = con.execute("SELECT canal, COUNT(DISTINCT bssid) FROM releves GROUP BY canal ORDER BY canal").fetchall()
+    con.close()
+    if not rows:
+        print("Base vide."); return
+    maxn = max(n for _, n in rows)
+    print("Occupation des canaux (bornes distinctes) :\n")
+    for canal, n in rows:
+        barre = "█" * int(n / maxn * 30) if maxn else ""
+        print(f"  canal {str(canal if canal is not None else '?'):>3} | {barre} {n}")
+    print("\n(2,4 GHz : préfère 1, 6 ou 11, qui ne se chevauchent pas.)")
+
+def cmd_twins(a):
+    con = connexion()
+    rows = con.execute("""SELECT ssid, bssid, securite, canal, MAX(rssi)
+        FROM releves WHERE ssid!='' AND ssid!='(masqué)'
+        GROUP BY bssid ORDER BY ssid""").fetchall()
+    con.close()
+    groupes = {}
+    for ssid, bssid, sec, canal, rssi in rows:
+        groupes.setdefault(ssid, []).append((bssid, sec, canal, rssi))
+    suspects = {s: v for s, v in groupes.items() if len(v) > 1}
+    if not suspects:
+        print("Aucun SSID porté par plusieurs bornes. Rien à signaler."); return
+    print("SSID portés par PLUSIEURS bornes (BSSID différents) :\n")
+    for ssid, liste in suspects.items():
+        tags = {secu_tag(s) for _, s, _, _ in liste}
+        fort = "  ⚠ SÉCURITÉS DIFFÉRENTES (clone ouvert ?)" if len(tags) > 1 else ""
+        print(f"• {ssid}  —  {len(liste)} bornes{fort}")
+        for bssid, sec, canal, rssi in liste:
+            print(f"     {bssid}  {vendor(bssid) or '?':<14} {secu_tag(sec):<5} canal {canal}  {rssi} dBm")
+        print()
+    print("Note : plusieurs BSSID pour un SSID, c'est SOUVENT normal (une box a")
+    print("une radio 2,4 GHz + une 5 GHz, un mesh a plusieurs bornes). Le vrai")
+    print("drapeau rouge = même nom mais sécurité qui change (ex. une copie OPEN")
+    print("d'un réseau WPA2) ou un constructeur incohérent.")
+
+def cmd_export(a):
+    con = connexion()
+    rows = con.execute("SELECT vu_le,bssid,ssid,canal,freq,rssi,securite,lat,lon,precision_m FROM releves").fetchall()
+    con.close()
+    if not rows:
+        print("Base vide."); return
+    cols = ["vu_le", "bssid", "ssid", "canal", "freq", "rssi", "securite", "lat", "lon", "precision_m"]
+    out = os.path.expanduser(f"~/.wood/export.{a.format}")
+    if a.format == "csv":
+        with open(out, "w", newline="", encoding="utf-8") as f:
+            w = _csv.writer(f); w.writerow(cols); w.writerows(rows)
+    elif a.format == "json":
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump([dict(zip(cols, r)) for r in rows], f, ensure_ascii=False, indent=1)
+    elif a.format == "gpx":
+        con = connexion()
+        pts = con.execute("""SELECT ssid,bssid,securite,canal,AVG(lat),AVG(lon)
+            FROM releves WHERE lat IS NOT NULL GROUP BY bssid""").fetchall()
+        con.close()
+        with open(out, "w", encoding="utf-8") as f:
+            f.write('<?xml version="1.0"?>\n<gpx version="1.1" creator="wood">\n')
+            for ssid, bssid, sec, canal, lat, lon in pts:
+                f.write(f'  <wpt lat="{lat}" lon="{lon}"><name>{ssid}</name>'
+                        f'<desc>{bssid} | {secu_tag(sec)} | canal {canal}</desc></wpt>\n')
+            f.write("</gpx>\n")
+    print(f"Export écrit : {out}  ({len(rows)} relevés)")
+
+def cmd_map(a):
+    con = connexion()
+    rows = con.execute("""SELECT bssid, ssid, securite, canal, AVG(lat), AVG(lon), MAX(rssi), COUNT(*)
+        FROM releves WHERE lat IS NOT NULL GROUP BY bssid""").fetchall()
+    con.close()
+    pts = [{"bssid": b, "ssid": s, "sec": secu_tag(sec), "canal": c,
+            "lat": lat, "lon": lon, "rssi": rssi, "n": n, "constr": vendor(b)}
+           for b, s, sec, c, lat, lon, rssi, n in rows]
+    if not pts:
+        print("Aucun relevé géolocalisé. Active le GPS puis relance 'wood' en te déplaçant.")
+        return
+    html = CARTE.replace("__POINTS__", json.dumps(pts))
+    out = os.path.expanduser("~/.wood/carte.html")
+    open(out, "w", encoding="utf-8").write(html)
+    print(f"Carte générée : {out}  ({len(pts)} bornes géolocalisées)")
+    print(f"Ouvre-la avec :  termux-open {out}")
+    print("(Les fonds de carte ont besoin d'Internet pour s'afficher.)")
+
+def cmd_track(a):
+    try:
+        from rich.live import Live
+        from rich.panel import Panel
+        from rich.text import Text
+        from rich.align import Align
+    except ImportError:
+        print("Le module 'rich' manque.  pip install rich"); return
+    cible = a.bssid.strip().lower()
+    prev = {"rssi": None}
+    def rendu():
+        r = None
+        for raw in scanner():
+            n = norm(raw)
+            if n["bssid"] and n["bssid"].lower() == cible:
+                r = n; break
+        if not r:
+            return Panel(Align.center(Text("borne non détectée sur ce scan…\n(hors de portée ?)", "red")),
+                         title=f"track {cible}", border_style="red")
+        rssi = r["rssi"]; p = prev["rssi"]
+        tend = "— premier relevé" if p is None else (
+            "↑  TU TE RAPPROCHES" if rssi > p else "↓  tu t'éloignes" if rssi < p else "=  stable")
+        prev["rssi"] = rssi
+        n = max(0, min(20, (rssi + 95)//3))
+        col = "bright_green" if rssi > -55 else "yellow" if rssi > -75 else "red"
+        corps = Text()
+        corps.append((r["ssid"] or "(masqué)") + "\n\n", "bold white")
+        corps.append("█"*n + "░"*(20-n) + "\n\n", col)
+        corps.append(f"{rssi} dBm\n\n", "bold " + col)
+        corps.append(tend, "bold")
+        return Panel(Align.center(corps), title=f"track {cible}  —  Ctrl-C quitter", border_style="green")
+    try:
+        with Live(rendu(), refresh_per_second=2, screen=True) as live:
+            while True:
+                live.update(rendu()); time.sleep(SCAN_INTERVAL)
+    except KeyboardInterrupt:
+        pass
 
 def cmd_upgrade(a):
     src_file = os.path.expanduser("~/.wood/source")
@@ -219,17 +370,53 @@ def cmd_upgrade(a):
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "rich"])
     print("wood est à jour. Relance 'wood'.")
 
+# ---------- gabarit carte ----------
+CARTE = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>wood — carte Wi-Fi</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>html,body,#m{height:100%;margin:0}</style></head>
+<body><div id="m"></div><script>
+var pts=__POINTS__;
+var map=L.map('m');
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+ {maxZoom:19,attribution:'© OpenStreetMap'}).addTo(map);
+var grp=[];
+pts.forEach(function(p){
+ var coul = p.sec==='OPEN' ? 'red' : (p.sec==='WEP' ? 'orange' : 'green');
+ var m=L.circleMarker([p.lat,p.lon],{radius:7,color:coul,fillOpacity:.7}).addTo(map);
+ m.bindPopup('<b>'+(p.ssid||'(masqué)')+'</b><br>'+p.bssid+
+   (p.constr?(' ('+p.constr+')'):'')+'<br>'+p.sec+' · canal '+p.canal+
+   '<br>signal max '+p.rssi+' dBm · vu '+p.n+'×');
+ grp.push([p.lat,p.lon]);
+});
+if(grp.length) map.fitBounds(grp,{padding:[30,30]}); else map.setView([0,0],2);
+</script></body></html>"""
+
 def main():
+    charger_oui()
     p = argparse.ArgumentParser(prog="wood", description="Collecteur passif de beacons Wi-Fi, temps réel (Termux)")
     sub = p.add_subparsers(dest="cmd")
-    sub.add_parser("live",    help="dashboard temps réel (défaut)")
-    sub.add_parser("scan",    help="un scan unique immédiat")
-    sub.add_parser("stats",   help="bilan de la base")
-    sub.add_parser("update",  help="met à jour wood depuis GitHub")
+    pl = sub.add_parser("live", help="dashboard temps réel (défaut)")
+    pl.add_argument("--open", action="store_true", help="n'afficher que les réseaux ouverts")
+    pl.add_argument("--ch", type=int, help="n'afficher qu'un canal")
+    sub.add_parser("scan", help="un scan unique immédiat")
+    sub.add_parser("stats", help="bilan de la base")
+    sub.add_parser("channels", help="occupation des canaux")
+    sub.add_parser("twins", help="détecte les SSID à plusieurs bornes (evil twin)")
+    sub.add_parser("map", help="génère une carte HTML des bornes géolocalisées")
+    pe = sub.add_parser("export", help="exporte la base (csv/json/gpx)")
+    pe.add_argument("format", nargs="?", default="csv", choices=["csv", "json", "gpx"])
+    pt = sub.add_parser("track", help="suit le signal d'une borne (BSSID)")
+    pt.add_argument("bssid")
+    sub.add_parser("update", help="met à jour wood depuis GitHub")
     sub.add_parser("upgrade", help="met à jour wood depuis GitHub (alias)")
     a = p.parse_args()
-    {"live": cmd_live, "scan": cmd_scan, "stats": cmd_stats,
-     "update": cmd_upgrade, "upgrade": cmd_upgrade}.get(a.cmd, cmd_live)(a)
+    cmds = {"live": cmd_live, "scan": cmd_scan, "stats": cmd_stats, "channels": cmd_channels,
+            "twins": cmd_twins, "map": cmd_map, "export": cmd_export, "track": cmd_track,
+            "update": cmd_upgrade, "upgrade": cmd_upgrade}
+    cmds.get(a.cmd, cmd_live)(a)
 
 if __name__ == "__main__":
     main()
