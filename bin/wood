@@ -314,12 +314,28 @@ def cmd_map(a):
     html = CARTE.replace("__POINTS__", json.dumps(pts))
     out = os.path.expanduser("~/.wood/carte.html")
     open(out, "w", encoding="utf-8").write(html)
-    print(f"Carte générée : {out}  ({len(pts)} bornes géolocalisées)")
+    import http.server, socketserver, functools
+    class Serveur(socketserver.TCPServer):
+        allow_reuse_address = True
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler,
+                                directory=os.path.dirname(out))
+    # port 0 = l'OS attribue un port libre -> aucun conflit avec tes autres services
+    httpd = Serveur(("127.0.0.1", 0), handler)
+    port = httpd.server_address[1]
+    url = f"http://127.0.0.1:{port}/carte.html"
+    print(f"Carte générée : {len(pts)} bornes géolocalisées.")
     try:
-        subprocess.run(["termux-open", "--content-type", "text/html", out])
-        print("Ouverture dans le navigateur… (fonds de carte = besoin d'Internet)")
+        subprocess.run(["termux-open-url", url])
     except FileNotFoundError:
-        print(f"Ouvre-la à la main :  termux-open {out}")
+        print("Ouvre dans ton navigateur :", url)
+    print(f"Service local actif sur {url}")
+    print("Ctrl-C pour arrêter le serveur quand tu as fini de regarder la carte.")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\narrêt du serveur.")
+    finally:
+        httpd.shutdown()
 
 def cmd_track(a):
     try:
