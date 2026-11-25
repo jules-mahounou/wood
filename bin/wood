@@ -1,15 +1,24 @@
 #!/data/data/com.termux/files/usr/bin/env python3
-# wood — collecteur passif de beacons Wi-Fi + GPS (Termux)
-import json, subprocess, sqlite3, time, sys, os, argparse
+# wood — collecteur passif de beacons Wi-Fi + GPS, temps réel (Termux)
+import json, subprocess, sqlite3, time, sys, os, argparse, threading
 from datetime import datetime, timezone
 
 DB = os.path.expanduser("~/.wood/wood.db")
-INTERVALLE = 30  # secondes entre deux scans
+SCAN_INTERVAL = 2     # secondes entre deux scans Wi-Fi
+LOC_INTERVAL  = 10    # secondes entre deux relevés GPS
+VERSION = "0.2.0"
 
+# ---------- état partagé entre threads ----------
+_lock  = threading.Lock()
+_store = {}   # bssid -> {ssid, canal, securite, rssi, freq, vu_count, last}
+_pos   = {"lat": None, "lon": None, "prec": None}
+_stop  = threading.Event()
+
+# ---------- base ----------
 def connexion():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
-    con = sqlite3.connect(DB)
-    con.execute("PRAGMA journal_mode=WAL")  # lecture/écriture simultanées (start + watch)
+    con = sqlite3.connect(DB, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL")
     con.execute("""CREATE TABLE IF NOT EXISTS releves (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         vu_le TEXT, bssid TEXT, ssid TEXT, canal INTEGER,
@@ -18,6 +27,7 @@ def connexion():
     con.commit()
     return con
 
+# ---------- helpers ----------
 def freq_vers_canal(mhz):
     if not mhz: return None
     if mhz == 2484: return 14
@@ -30,8 +40,7 @@ def cmd_json(args):
         out = subprocess.run(args, capture_output=True, text=True, timeout=60)
         txt = out.stdout.strip()
         return json.loads(txt) if txt else None
-    except Exception as e:
-        print(f"  ! {args[0]} : {e}", file=sys.stderr)
+    except Exception:
         return None
 
 def scanner():
@@ -51,70 +60,134 @@ def norm(r):
             "rssi": r.get("rssi") or r.get("level"),
             "securite": r.get("capabilities") or r.get("security") or ""}
 
-def enregistrer(con, reseaux, lat, lon, prec):
-    vu = datetime.now(timezone.utc).isoformat()
-    for raw in reseaux:
-        r = norm(raw)
-        con.execute("INSERT INTO releves (vu_le,bssid,ssid,canal,freq,rssi,securite,lat,lon,precision_m)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (vu, r["bssid"], r["ssid"], r["canal"], r["freq"],
-                     r["rssi"], r["securite"], lat, lon, prec))
-    con.commit()
-    return vu
+def est_ouvert(s):
+    return ("WPA" not in s) and ("WEP" not in s)
 
-def cmd_start(a):
-    con = connexion()
-    print(f"wood start — collecte en continu (toutes les {INTERVALLE}s). Ctrl-C pour arrêter.\n")
+# ---------- moteur temps réel (threads) ----------
+def _boucle_scan(con):
+    while not _stop.is_set():
+        reseaux = scanner()
+        vu = datetime.now(timezone.utc).isoformat()
+        with _lock:
+            lat, lon, prec = _pos["lat"], _pos["lon"], _pos["prec"]
+        rows = []
+        for raw in reseaux:
+            r = norm(raw)
+            if not r["bssid"]:
+                continue
+            rows.append((vu, r["bssid"], r["ssid"], r["canal"], r["freq"],
+                         r["rssi"], r["securite"], lat, lon, prec))
+            with _lock:
+                e = _store.get(r["bssid"], {"vu_count": 0})
+                e.update(ssid=r["ssid"], canal=r["canal"], securite=r["securite"],
+                         rssi=r["rssi"], freq=r["freq"], last=vu)
+                e["vu_count"] += 1
+                _store[r["bssid"]] = e
+        if rows:
+            with _lock:
+                con.executemany(
+                    "INSERT INTO releves (vu_le,bssid,ssid,canal,freq,rssi,securite,lat,lon,precision_m)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+                con.commit()
+        _stop.wait(SCAN_INTERVAL)
+
+def _boucle_pos():
+    while not _stop.is_set():
+        lat, lon, prec = position()
+        with _lock:
+            _pos.update(lat=lat, lon=lon, prec=prec)
+        _stop.wait(LOC_INTERVAL)
+
+# ---------- affichage (rich) ----------
+def _barre(rssi):
+    from rich.text import Text
+    if rssi is None: return Text("—")
+    n = max(0, min(5, (rssi + 95)//12))     # -95 → 0, -35 → 5
+    col = "bright_green" if n >= 4 else "yellow" if n >= 2 else "red"
+    return Text("█"*n + "░"*(5-n) + f" {rssi}", style=col)
+
+def _secu(s):
+    from rich.text import Text
+    if "WPA3" in s: return Text("WPA3", "bright_green")
+    if "WPA2" in s: return Text("WPA2", "cyan")
+    if "WPA"  in s: return Text("WPA",  "yellow")
+    if "WEP"  in s: return Text("WEP",  "yellow")
+    return Text("OUVERT", "bold red")
+
+def _rendu():
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.console import Group
+    from rich.text import Text
+    with _lock:
+        items = sorted(_store.values(), key=lambda e: (e.get("rssi") or -999), reverse=True)
+        pos = dict(_pos); total = len(_store)
+        ouverts = sum(1 for e in _store.values() if est_ouvert(e.get("securite", "")))
+    t = Table(expand=True, header_style="bold green", border_style="green")
+    t.add_column("SSID", ratio=3, no_wrap=True)
+    t.add_column("BSSID", ratio=3, no_wrap=True)
+    t.add_column("Ch", justify="right")
+    t.add_column("Sécurité")
+    t.add_column("Signal", ratio=2)
+    t.add_column("Vu", justify="right")
+    for e in items[:40]:
+        t.add_row(e.get("ssid", "?"), e.get("bssid", ""), str(e.get("canal") or "?"),
+                  _secu(e.get("securite", "")), _barre(e.get("rssi")), str(e.get("vu_count", 0)))
+    gps = f"GPS {pos['lat']:.5f},{pos['lon']:.5f}" if pos["lat"] else "GPS …"
+    entete = Text.assemble(
+        ("WOOD ", "bold bright_green"), (f"v{VERSION}   ", "green"),
+        (f"{os.cpu_count() or '?'} cœurs   ", "white"),
+        (f"{total} bornes   ", "bold white"),
+        (f"{ouverts} ouvertes   ", "red"), (gps, "cyan"),
+        ("   [Ctrl-C quitter]", "dim"))
+    return Panel(Group(entete, t), border_style="green",
+                 title="collecteur Wi-Fi passif — temps réel")
+
+# ---------- commandes ----------
+def cmd_live(a):
     try:
-        while True:
-            lat, lon, prec = position()
-            reseaux = scanner()
-            vu = enregistrer(con, reseaux, lat, lon, prec)
-            print(f"[{vu[11:19]}] {len(reseaux)} réseaux  (pos {lat}, {lon})")
-            time.sleep(INTERVALLE)
+        from rich.live import Live
+    except ImportError:
+        print("Le module 'rich' manque.  Installe-le :  pip install rich"); return
+    con = connexion()
+    threading.Thread(target=_boucle_scan, args=(con,), daemon=True).start()
+    threading.Thread(target=_boucle_pos, daemon=True).start()
+    try:
+        with Live(_rendu(), refresh_per_second=4, screen=True) as live:
+            while not _stop.is_set():
+                live.update(_rendu())
+                time.sleep(0.25)
     except KeyboardInterrupt:
-        print("\narrêt.")
+        pass
     finally:
-        con.close()
+        _stop.set(); time.sleep(0.3); con.close()
+        with _lock:
+            print(f"arrêt. {len(_store)} bornes uniques vues cette session.")
 
 def cmd_update(a):
     con = connexion()
     lat, lon, prec = position()
     reseaux = scanner()
-    enregistrer(con, reseaux, lat, lon, prec)
+    vu = datetime.now(timezone.utc).isoformat()
+    for raw in reseaux:
+        r = norm(raw)
+        con.execute("INSERT INTO releves (vu_le,bssid,ssid,canal,freq,rssi,securite,lat,lon,precision_m)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (vu, r["bssid"], r["ssid"], r["canal"], r["freq"], r["rssi"], r["securite"], lat, lon, prec))
+    con.commit()
     print(f"{len(reseaux)} réseaux captés et enregistrés.\n")
     for raw in reseaux:
         r = norm(raw)
         print(f"   {r['ssid']:<24} {r['bssid']}  canal {r['canal']}  {r['rssi']} dBm  {r['securite']}")
     con.close()
 
-def cmd_watch(a):
-    con = connexion()
-    dernier = con.execute("SELECT COALESCE(MAX(id),0) FROM releves").fetchone()[0]
-    print("wood watch — nouveaux relevés en direct. Ctrl-C pour arrêter.\n")
-    try:
-        while True:
-            for row in con.execute(
-                "SELECT id,vu_le,ssid,bssid,canal,rssi,securite FROM releves WHERE id>? ORDER BY id",
-                (dernier,)).fetchall():
-                dernier = row[0]
-                print(f"[{row[1][11:19]}] {row[2]:<24} {row[3]}  canal {row[4]}  {row[5]} dBm  {row[6]}")
-            time.sleep(2)
-    except KeyboardInterrupt:
-        print("\narrêt.")
-    finally:
-        con.close()
-
 def cmd_stats(a):
-    con = connexion()
-    q = con.execute
+    con = connexion(); q = con.execute
     total = q("SELECT COUNT(*) FROM releves").fetchone()[0]
     if total == 0:
-        print("Base vide. Lance d'abord 'wood start' ou 'wood update'."); con.close(); return
+        print("Base vide. Lance 'wood' (temps réel) ou 'wood update'."); con.close(); return
     uniq = q("SELECT COUNT(DISTINCT bssid) FROM releves").fetchone()[0]
-    print(f"Relevés enregistrés : {total}")
-    print(f"Bornes uniques      : {uniq}")
-    print("\nPar type de sécurité :")
+    print(f"Relevés enregistrés : {total}\nBornes uniques      : {uniq}\n\nPar type de sécurité :")
     for sec, n in q("""SELECT CASE
                 WHEN securite LIKE '%WPA3%' THEN 'WPA3'
                 WHEN securite LIKE '%WPA2%' THEN 'WPA2'
@@ -130,15 +203,13 @@ def cmd_stats(a):
     con.close()
 
 def main():
-    p = argparse.ArgumentParser(prog="wood", description="Collecteur passif de beacons Wi-Fi (Termux)")
+    p = argparse.ArgumentParser(prog="wood", description="Collecteur passif de beacons Wi-Fi, temps réel (Termux)")
     sub = p.add_subparsers(dest="cmd")
-    sub.add_parser("start",  help="collecte en continu")
+    sub.add_parser("live",   help="dashboard temps réel (défaut)")
     sub.add_parser("update", help="un scan unique immédiat")
-    sub.add_parser("watch",  help="affiche les nouveaux relevés en direct")
     sub.add_parser("stats",  help="bilan de la base")
     a = p.parse_args()
-    {"start": cmd_start, "update": cmd_update,
-     "watch": cmd_watch, "stats": cmd_stats}.get(a.cmd, lambda _: p.print_help())(a)
+    {"live": cmd_live, "update": cmd_update, "stats": cmd_stats}.get(a.cmd, cmd_live)(a)
 
 if __name__ == "__main__":
     main()
