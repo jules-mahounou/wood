@@ -315,8 +315,11 @@ def cmd_map(a):
     out = os.path.expanduser("~/.wood/carte.html")
     open(out, "w", encoding="utf-8").write(html)
     print(f"Carte générée : {out}  ({len(pts)} bornes géolocalisées)")
-    print(f"Ouvre-la avec :  termux-open {out}")
-    print("(Les fonds de carte ont besoin d'Internet pour s'afficher.)")
+    try:
+        subprocess.run(["termux-open", "--content-type", "text/html", out])
+        print("Ouverture dans le navigateur… (fonds de carte = besoin d'Internet)")
+    except FileNotFoundError:
+        print(f"Ouvre-la à la main :  termux-open {out}")
 
 def cmd_track(a):
     try:
