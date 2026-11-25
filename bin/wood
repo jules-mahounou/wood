@@ -55,9 +55,9 @@ def freq_vers_canal(mhz):
     if 5000 <= mhz <= 5900: return (mhz - 5000)//5
     return None
 
-def cmd_json(args):
+def cmd_json(args, timeout=60):
     try:
-        out = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        out = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
         txt = out.stdout.strip()
         return json.loads(txt) if txt else None
     except Exception:
@@ -68,9 +68,12 @@ def scanner():
     return d if isinstance(d, list) else []
 
 def position():
-    loc = cmd_json(["termux-location", "-p", "network"])
-    if not loc: return (None, None, None)
-    return (loc.get("latitude"), loc.get("longitude"), loc.get("accuracy"))
+    # GPS d'abord (précis, pour l'extérieur), repli sur network (rapide, grossier)
+    for prov in ("gps", "network"):
+        loc = cmd_json(["termux-location", "-p", prov], timeout=20)
+        if loc and loc.get("latitude") is not None:
+            return (loc.get("latitude"), loc.get("longitude"), loc.get("accuracy"))
+    return (None, None, None)
 
 def norm(r):
     freq = r.get("frequency_mhz") or r.get("frequency")
@@ -163,7 +166,11 @@ def _rendu():
         t.add_row(e.get("ssid", "?"), _barre(e.get("rssi")),
                   _secu(e.get("securite", "")), str(e.get("canal") or "?"),
                   vendor(e.get("bssid")) or e.get("bssid", ""), str(e.get("vu_count", 0)))
-    gps = f"GPS {pos['lat']:.5f},{pos['lon']:.5f}" if pos["lat"] else "GPS …"
+    if pos["lat"]:
+        acc = f" ±{int(pos['prec'])}m" if pos.get("prec") else ""
+        gps = f"GPS {pos['lat']:.5f},{pos['lon']:.5f}{acc}"
+    else:
+        gps = "GPS …"
     nb = f"{len(items)}/{tous}" if (_filtre["open"] or _filtre["ch"] is not None) else str(tous)
     entete = Text.assemble(
         ("WOOD ", "bold bright_green"), (f"v{VERSION}   ", "green"),
