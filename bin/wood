@@ -68,12 +68,11 @@ def scanner():
     return d if isinstance(d, list) else []
 
 def position():
-    # On lit le DERNIER fix connu (instantané) pour ne jamais bloquer le scan Wi-Fi :
-    # Termux:API ne traite qu'une requête à la fois, un GPS qui cherche un fix gèle tout.
-    for args in (["-p", "gps", "-r", "last"], ["-p", "network"]):
-        loc = cmd_json(["termux-location"] + args, timeout=15)
-        if loc and loc.get("latitude") is not None:
-            return (loc.get("latitude"), loc.get("longitude"), loc.get("accuracy"))
+    # Positionnement réseau : rapide, ne bloque pas le scan Wi-Fi (Termux:API
+    # ne traite qu'une requête à la fois). Précision grossière mais fonctionnelle.
+    loc = cmd_json(["termux-location", "-p", "network"], timeout=10)
+    if loc and loc.get("latitude") is not None:
+        return (loc.get("latitude"), loc.get("longitude"), loc.get("accuracy"))
     return (None, None, None)
 
 def norm(r):
