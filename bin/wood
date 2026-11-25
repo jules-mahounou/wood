@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 DB = os.path.expanduser("~/.wood/wood.db")
 SCAN_INTERVAL = 2
-LOC_INTERVAL  = 10
+LOC_INTERVAL  = 30
 VERSION = "0.3.0"
 
 # ---------- état partagé ----------
@@ -70,7 +70,7 @@ def scanner():
 def position():
     # Positionnement réseau : rapide, ne bloque pas le scan Wi-Fi (Termux:API
     # ne traite qu'une requête à la fois). Précision grossière mais fonctionnelle.
-    loc = cmd_json(["termux-location", "-p", "network"], timeout=10)
+    loc = cmd_json(["termux-location", "-p", "network"], timeout=25)
     if loc and loc.get("latitude") is not None:
         return (loc.get("latitude"), loc.get("longitude"), loc.get("accuracy"))
     return (None, None, None)
@@ -121,8 +121,9 @@ def _boucle_scan(con):
 def _boucle_pos():
     while not _stop.is_set():
         lat, lon, prec = position()
-        with _lock:
-            _pos.update(lat=lat, lon=lon, prec=prec)
+        if lat is not None:          # garde la dernière position connue si la lecture échoue
+            with _lock:
+                _pos.update(lat=lat, lon=lon, prec=prec)
         _stop.wait(LOC_INTERVAL)
 
 # ---------- affichage rich ----------
